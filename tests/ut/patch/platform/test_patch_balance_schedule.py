@@ -821,6 +821,47 @@ def test_balance_schedule_waiting_and_running_paths():
     scheduler.schedule(throttle_prefills=True)
 
 
+@pytest.mark.parametrize("async_load", [False, True])
+def test_balance_schedule_records_prefill_latency_after_lookup_retry(async_load):
+    scheduler = _make_balance_scheduler(dp_size=1)
+    (request,) = _create_requests(1, num_tokens=2 * _BLOCK_SIZE)
+    scheduler.add_request(request)
+    request_id = request.request_id
+
+    latency = MagicMock(queued={request_id: 0}, lookup_started={}, load_started={})
+    scheduler.prefill_latency = latency
+    scheduler.connector = MagicMock()
+    matched = _BLOCK_SIZE if async_load else 0
+    scheduler.connector.get_num_new_matched_tokens.side_effect = [(None, True), (matched, async_load)]
+    scheduler._build_kv_connector_meta = MagicMock(return_value="meta")
+
+    pending = scheduler.schedule()
+    assert not pending.num_scheduled_tokens
+    assert pending.prefill_latency_request_ids == ()
+    assert request_id in latency.lookup_started
+
+    output = scheduler.schedule()
+    assert output.prefill_latency_request_ids == (request_id,)
+    assert request_id not in latency.lookup_started
+    latency.check.assert_called_with(request_id)
+    calls = latency.record.call_args_list
+    assert [call.kwargs["matched_tokens"] for call in calls if call.kwargs.get("source") == "external"] == [
+        None,
+        matched,
+    ]
+    assert any(call.args[1] == "cache_lookup" and call.kwargs.get("source") == "local" for call in calls)
+    assert any(call.args[1] == "external_lookup_elapsed" for call in calls)
+    assert all(call.args[2] <= call.args[3] for call in calls)
+
+    if async_load:
+        assert not output.num_scheduled_tokens
+        assert request_id in latency.load_started
+        latency.schedule.assert_not_called()
+    else:
+        assert output.num_scheduled_tokens[request_id] == request.num_prompt_tokens
+        latency.schedule.assert_called_once_with(request_id)
+
+
 def test_balance_schedule_pause_freeze_and_v2():
     import torch
     from vllm.v1.core.sched.interface import PauseState
