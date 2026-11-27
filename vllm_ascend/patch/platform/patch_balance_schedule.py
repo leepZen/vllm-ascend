@@ -196,6 +196,8 @@ class BalanceScheduler(Scheduler):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        latency = getattr(self, "prefill_latency", None)
+        async_load_ids: list[str] = []
 
         self.kv_cache_manager.new_step_starts()
 
@@ -408,6 +410,8 @@ class BalanceScheduler(Scheduler):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if latency is not None:
+                    latency.check(request_id)
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(request.status) and not self._try_promote_blocked_waiting_request(
@@ -444,6 +448,8 @@ class BalanceScheduler(Scheduler):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    record_lookup = latency is not None and request_id in latency.queued
+                    lookup_start = time.monotonic_ns() if record_lookup else 0
                     # Get locally-cached tokens.
                     if (
                         self.connector is not None
@@ -479,6 +485,13 @@ class BalanceScheduler(Scheduler):
                         new_computed_blocks, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_blocks(
                             request
                         )
+                    if latency is not None and record_lookup:
+                        latency.record_cache_lookup(
+                            request_id,
+                            lookup_start,
+                            time.monotonic_ns(),
+                            source="local",
+                        )
 
                     # In case of hybrid models, obtain hint for Marconi-style APC logic
                     if self.has_mamba_layers:
@@ -490,9 +503,18 @@ class BalanceScheduler(Scheduler):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
+                        lookup_start = time.monotonic_ns() if record_lookup else 0
                         ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
                             request, num_new_local_computed_tokens
                         )
+                        if latency is not None and record_lookup:
+                            latency.record_cache_lookup(
+                                request_id,
+                                lookup_start,
+                                time.monotonic_ns(),
+                                source="external",
+                                matched_tokens=ext_tokens,
+                            )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -664,6 +686,9 @@ class BalanceScheduler(Scheduler):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    if latency is not None and request_id in latency.queued:
+                        latency.load_started[request_id] = time.monotonic_ns()
+                        async_load_ids.append(request_id)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
@@ -697,6 +722,8 @@ class BalanceScheduler(Scheduler):
                     scheduled_loras.add(request.lora_request.lora_int_id)
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(request_id)
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if latency is not None:
+                    latency.schedule(request_id)
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -819,6 +846,18 @@ class BalanceScheduler(Scheduler):
         if self.ec_connector is not None:
             ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(scheduler_output)
             scheduler_output.ec_connector_metadata = ec_meta
+
+        if latency is not None:
+            prefill_ids = (
+                req_id
+                for req_id in num_scheduled_tokens
+                if req_id in latency.queued
+                and self.requests[req_id].num_computed_tokens < self.requests[req_id].num_prompt_tokens
+            )
+            scheduler_output.prefill_latency_request_ids = (
+                *async_load_ids,
+                *prefill_ids,
+            )
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).

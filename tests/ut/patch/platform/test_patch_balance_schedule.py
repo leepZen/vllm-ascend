@@ -4,8 +4,8 @@
 These tests watch the upstream vLLM surfaces that ``patch_balance_schedule.py``
 depends on. If upstream changes any of them in a way that would silently break
 the patch (or stop it from taking effect), CI turns red here so we notice and
-sync. They are NOT behavior/equivalence tests -- those need a running DP+MoE
-engine on NPU and live under e2e/nightly.
+sync. Prefill instrumentation also has CPU coverage. Full behavior and
+equivalence tests need a running DP+MoE engine on NPU and live under e2e/nightly.
 
 What is guarded here (everything reachable from CPU UT):
 
@@ -24,7 +24,7 @@ What is guarded here (everything reachable from CPU UT):
 * the copied ``schedule()`` body stays a verbatim copy of the ``schedule()``
   at vllm-ascend's pinned vLLM release tag (read from
   ``.github/vllm-release-tag.commit`` -- the same file CI uses), modulo exactly
-  those 3 deltas. Reading the tag from the pin file means a pin advance
+  those 3 deltas and the prefill instrumentation. A pin advance
   auto-flips this guard to the new tag until the copy is re-synced.
 
 What is NOT guarded here (structurally unreachable without a real engine):
@@ -211,18 +211,77 @@ def test_balance_scheduler_does_not_import_sfr_when_disabled(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Prefill instrumentation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("async_load", [False, True])
+def test_balance_schedule_records_prefill_latency_after_lookup_retry(async_load):
+    from tests.ut.kv_offload import utils
+
+    config = utils.create_vllm_config(block_size=16)
+    config.kv_transfer_config = None
+    ascend_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            short_request_first_config=SimpleNamespace(enabled=False),
+        ),
+    )
+    with (
+        patch.object(utils, "Scheduler", BalanceScheduler),
+        patch("vllm_ascend.patch.platform.patch_balance_schedule.init_ascend_config", return_value=ascend_config),
+        patch("vllm_ascend.patch.platform.patch_balance_schedule._balance_scheduling_enabled", return_value=True),
+    ):
+        scheduler = utils.create_scheduler(config, num_blocks=64)
+    request = utils.create_request(request_id=1, num_tokens=32)
+    scheduler.add_request(request)
+    request_id = request.request_id
+
+    latency = MagicMock(queued={request_id: 0}, load_started={})
+    scheduler.prefill_latency = latency
+    scheduler.connector = MagicMock()
+    matched = 16 if async_load else 0
+    scheduler.connector.get_num_new_matched_tokens.side_effect = [(None, True), (matched, async_load)]
+    scheduler._build_kv_connector_meta = MagicMock(return_value="meta")
+
+    pending = scheduler.schedule()
+    assert not pending.num_scheduled_tokens
+    assert pending.prefill_latency_request_ids == ()
+    assert latency.record_cache_lookup.call_count == 2
+
+    output = scheduler.schedule()
+    assert output.prefill_latency_request_ids == (request_id,)
+    latency.check.assert_called_with(request_id)
+    calls = latency.record_cache_lookup.call_args_list
+    assert [(call.kwargs["source"], call.kwargs.get("matched_tokens")) for call in calls] == [
+        ("local", None),
+        ("external", None),
+        ("local", None),
+        ("external", matched),
+    ]
+    assert all(call.args[0] == request_id and call.args[1] <= call.args[2] for call in calls)
+    if async_load:
+        assert not output.num_scheduled_tokens
+        assert request_id in latency.load_started
+        latency.schedule.assert_not_called()
+    else:
+        assert output.num_scheduled_tokens[request_id] == request.num_prompt_tokens
+        latency.schedule.assert_called_once_with(request_id)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
 def _schedule_body_ast(source: str) -> str:
-    """Canonical AST dump of a ``schedule`` method body with the 3 balance
-    deltas stripped, so the remainder can be compared verbatim against the
+    """Canonical AST of a schedule body with balance and timing deltas removed.
+
+    The remaining statements can be compared verbatim against the
     pinned release tag's ``schedule()``. AST-based on purpose: it is blind to
     comments and whitespace, so the only differences that surface are real code
     drift (not the escape-quoting of a comment or reformatting).
 
-    The 3 deltas removed:
+    The balance deltas removed:
       * delta 1 -- the disabled-path early return (``if not
         self._balance_enabled: ... super().schedule(...)``);
       * delta 2 -- the ``balance_flag`` gate (``max(t.item() for t in
@@ -238,9 +297,27 @@ def _schedule_body_ast(source: str) -> str:
         None,
     )
     assert func is not None, "no schedule() in source"
+    latency_test = ast.dump(ast.parse("latency is not None", mode="eval").body)
 
     class _BalanceDeltaStripper(ast.NodeTransformer):
+        def visit_Assign(self, node: ast.Assign):  # noqa: N802
+            names = {"latency", "record_lookup", "lookup_start"}
+            if any(isinstance(target, ast.Name) and target.id in names for target in node.targets):
+                return None
+            return self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign):  # noqa: N802
+            if isinstance(node.target, ast.Name) and node.target.id == "async_load_ids":
+                return None
+            return self.generic_visit(node)
+
         def visit_If(self, node: ast.If):  # noqa: N802
+            timing_guard = node.test
+            if isinstance(timing_guard, ast.BoolOp) and isinstance(timing_guard.op, ast.And):
+                timing_guard = timing_guard.values[0]
+            if ast.dump(timing_guard) == latency_test:
+                return None
+
             test = ast.dump(node.test)
             # delta 1: disabled-path early return.
             if "_balance_enabled" in test:
@@ -356,8 +433,8 @@ def test_balance_deltas_present_in_schedule():
 
 def test_schedule_body_matches_pinned_release_tag():
     """The copied ``schedule()`` body must stay a verbatim copy of the
-    ``schedule()`` at vllm-ascend's pinned vLLM release tag, modulo exactly the
-    3 balance deltas.
+    ``schedule()`` at the pinned vLLM release tag, allowing the balance and
+    prefill instrumentation changes.
 
     The tag is read dynamically from ``.github/vllm-release-tag.commit`` -- the
     same file CI uses to pick the tag, NOT a hardcoded string or a design doc
@@ -380,9 +457,7 @@ def test_schedule_body_matches_pinned_release_tag():
     theirs = _schedule_body_ast(pinned_src)
     assert ours == theirs, (
         f"BalanceScheduler.schedule body drifted from the pinned release tag "
-        f"({tag}) beyond the 3 balance deltas. Re-sync the copy against "
-        f"{tag} and re-apply only: (1) disabled-path early return, "
-        f"(2) balance_flag gate, (3) if request_queue is None: break."
+        f"({tag}) beyond the balance deltas and prefill instrumentation."
     )
 
 
